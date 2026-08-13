@@ -367,18 +367,27 @@ def generate_title(
             task="title_generation",
             messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_snippet}],
             # A title is a handful of tokens, but 64 was cut mid-JSON by fenced/prefixed replies and by
-            # reasoning models whose thinking survives the disable below (#83903, #82291). A model that
-            # honours the JSON contract stops after ~15 tokens regardless, so the ceiling only costs on
-            # replies that would have been garbage anyway. temperature=None: omitted from the wire so
-            # default-only reasoning models accept the first request (#72351).
-            max_tokens=TITLE_MAX_TOKENS, temperature=None, timeout=timeout, main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+            # reasoning models whose thinking survives the disable below (#83903, #82291); on backends
+            # that ignore the thinking-disabled request, the chain-of-thought alone can exceed the
+            # ceiling, so every token goes to `reasoning_content` and `content` comes back empty -> the
+            # title silently fails. 2048 leaves room to finish thinking AND emit the tiny title;
+            # non-reasoning models just stop after the short answer. temperature=None: omitted from
+            # the wire so default-only reasoning models accept the first request (#72351).
+            max_tokens=2048, temperature=None, timeout=timeout, main_runtime=main_runtime,
+            # Strict json_schema response_format is rejected (HTTP 400) or
+            # silently aborted (empty content) by several OpenAI-compatible
+            # backends (DeepSeek, vLLM guided_grammar, LM Studio MLX
+            # Qwen3.x). Use free-text and let _extract_title_text's JSON scan
+            # + prose fallback handle the shape, which it already does for
+            # non-compliant providers.
+            extra_body={"response_format": {"type": "text"}},
             # The module contract above promises thinking-disabled operation,
             # but nothing enforced it: with the aux default reasoning_effort
             # "" (provider default), Gemini enables internal thinking and
-            # bills thought tokens against max_tokens=64 — the JSON payload
+            # bills thought tokens against the budget — the JSON payload
             # never lands, and the prose fallback stores the opening fence
-            # ("```json") as the session title (#91927).
+            # ("```json") as the session title (#91927). Backends that ignore
+            # this request are covered by the larger max_tokens above.
             reasoning_config={"enabled": False},
         )
         message = response.choices[0].message
