@@ -1,5 +1,17 @@
 name: holographic
 version: 0.1.0
 description: "Holographic memory — local SQLite fact store with FTS5 search, trust scoring, and HRR-based compositional retrieval."
+# Optional language-aware tokenizers are lazy-installed via tools/lazy_deps.py
+# on first use — one feature per language so a user only installs what their
+# queries actually use:
+#   memory.holographic.tokenizer.jieba     → Chinese
+#   memory.holographic.tokenizer.fugashi   → Japanese
+#   memory.holographic.tokenizer.pythainlp → Thai
+# Korean (konlpy) needs a JVM, so it is installed manually.
+# Keep pins in sync with those LAZY_DEPS entries and the
+# holographic-tokenizer-* extras in pyproject.toml. The provider works
+# without any of them (trigram + LIKE fallback covers every script).
+pip_dependencies: []
+requires_env: []
 hooks:
   - on_session_end

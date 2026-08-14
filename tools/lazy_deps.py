@@ -201,6 +201,23 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # instance and the provider silently reports itself unavailable.
     "memory.supermemory": ("supermemory==3.50.0",),
     "memory.mem0": ("mem0ai==2.0.10",),
+    # Optional language-aware tokenizers for the local holographic memory
+    # provider's FTS5 search. Each language is its OWN lazy-deps feature so a
+    # user only installs what their queries actually use (searching Chinese
+    # never pulls the Japanese or Thai tokenizer). The provider works without
+    # any of them (trigram + LIKE fallback covers every script); installing
+    # one improves semantic tokenization for that language. Only specs in
+    # this allowlist can be pip-installed by the runtime.
+    # konlpy (Korean) is intentionally NOT here: it requires a JVM at
+    # import time, which most machines lack, and would break every fresh
+    # install — Korean users can `pip install konlpy` themselves (the
+    # provider detects it at runtime).
+    "memory.holographic.tokenizer.jieba": ("jieba==0.42.1",),
+    "memory.holographic.tokenizer.fugashi": (
+        "fugashi==1.5.2",
+        "unidic-lite==1.0.8",
+    ),
+    "memory.holographic.tokenizer.pythainlp": ("pythainlp==5.3.5",),
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.8",),

@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
 CREATE INDEX IF NOT EXISTS idx_entities_name  ON entities(name);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
-    USING fts5(content, tags, content=facts, content_rowid=fact_id);
+    USING fts5(content, tags, content=facts, content_rowid=fact_id, tokenize='trigram');
 
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
     INSERT INTO facts_fts(rowid, content, tags)
@@ -179,7 +179,39 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        self._migrate_fts_tokenizer()
         self._conn.commit()
+
+    def _migrate_fts_tokenizer(self) -> None:
+        """Rebuild facts_fts with the trigram tokenizer if it predates it.
+
+        Older databases created the FTS index with FTS5's default unicode61
+        tokenizer, which treats an unbroken CJK run as a single token and
+        therefore never matches spaced natural-language queries. The trigram
+        tokenizer is language-agnostic (any 3+ char substring is searchable)
+        and is required for the CJK tokenizer/LIKE query path. Because
+        ``CREATE VIRTUAL TABLE IF NOT EXISTS`` is a no-op on an existing
+        table, detect the current tokenizer and rebuild when it differs.
+        """
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='facts_fts'"
+        ).fetchone()
+        if row is None:
+            return
+        if "tokenize='trigram'" in (row[0] or ""):
+            return
+        # Rebuild: external-content table (content=facts), so drop the
+        # shadow table, recreate with trigram, and repopulate from facts.
+        self._conn.execute("DROP TABLE facts_fts")
+        self._conn.execute(
+            "CREATE VIRTUAL TABLE facts_fts "
+            "USING fts5(content, tags, content=facts, content_rowid=fact_id, "
+            "tokenize='trigram')"
+        )
+        self._conn.execute(
+            "INSERT INTO facts_fts(rowid, content, tags) "
+            "SELECT fact_id, content, tags FROM facts"
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -261,20 +293,49 @@ class MemoryStore:
                 params.append(category)
             params.append(limit)
 
-            sql = f"""
-                SELECT f.fact_id, f.content, f.category, f.tags,
-                       f.trust_score, f.retrieval_count, f.helpful_count,
-                       f.created_at, f.updated_at
-                FROM facts f
-                JOIN facts_fts fts ON fts.rowid = f.fact_id
-                WHERE facts_fts MATCH ?
-                  AND f.trust_score >= ?
-                  {category_clause}
-                ORDER BY fts.rank, f.trust_score DESC
-                LIMIT ?
-            """
-
-            rows = self._conn.execute(sql, params).fetchall()
+            # The trigram tokenizer only matches terms of 3+ characters.
+            # When every meaningful term is shorter (e.g. a two-character
+            # Chinese word like 微信), fall back to a LIKE scan so short
+            # CJK terms stay searchable (cost is negligible at personal-
+            # memory scale). Each short term becomes an OR'd LIKE pattern.
+            like_patterns = FactRetriever._short_term_like(query)
+            if like_patterns:
+                like_clauses = " OR ".join(
+                    f"(f.content LIKE ? OR f.tags LIKE ?)"
+                    for _ in like_patterns
+                )
+                like_params: list = []
+                for pat in like_patterns:
+                    like_params.extend([pat, pat])
+                like_params.extend(params[1:])
+                rows = self._conn.execute(
+                    f"""
+                    SELECT f.fact_id, f.content, f.category, f.tags,
+                           f.trust_score, f.retrieval_count, f.helpful_count,
+                           f.created_at, f.updated_at
+                    FROM facts f
+                    WHERE ({like_clauses})
+                      AND f.trust_score >= ?
+                      {category_clause}
+                    ORDER BY f.trust_score DESC
+                    LIMIT ?
+                    """,
+                    like_params,
+                ).fetchall()
+            else:
+                sql = f"""
+                    SELECT f.fact_id, f.content, f.category, f.tags,
+                           f.trust_score, f.retrieval_count, f.helpful_count,
+                           f.created_at, f.updated_at
+                    FROM facts f
+                    JOIN facts_fts fts ON fts.rowid = f.fact_id
+                    WHERE facts_fts MATCH ?
+                      AND f.trust_score >= ?
+                      {category_clause}
+                    ORDER BY fts.rank, f.trust_score DESC
+                    LIMIT ?
+                """
+                rows = self._conn.execute(sql, params).fetchall()
             results = [self._row_to_dict(r) for r in rows]
 
             if results:

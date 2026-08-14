@@ -168,6 +168,12 @@ class HolographicMemoryProvider(MemoryProvider):
         hrr_dim = int(self._config.get("hrr_dim", 1024))
         hrr_weight = float(self._config.get("hrr_weight", 0.3))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
+        # Languages opted into for semantic tokenization. Empty/missing →
+        # all supported languages enabled (n-gram fallback always works);
+        # set explicitly to a subset to only lazy-install those tokenizers.
+        enabled_tokenizers = self._config.get("tokenizers")
+        if isinstance(enabled_tokenizers, (list, tuple, set)):
+            enabled_tokenizers = {str(x).lower() for x in enabled_tokenizers}
 
         self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
         self._retriever = FactRetriever(
@@ -175,6 +181,7 @@ class HolographicMemoryProvider(MemoryProvider):
             temporal_decay_half_life=temporal_decay,
             hrr_weight=hrr_weight,
             hrr_dim=hrr_dim,
+            enabled_tokenizers=enabled_tokenizers,
         )
         self._session_id = session_id
 

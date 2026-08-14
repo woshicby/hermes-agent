@@ -7,8 +7,9 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from .store import MemoryStore
@@ -22,6 +23,11 @@ except ImportError:
 class FactRetriever:
     """Multi-strategy fact retrieval with trust-weighted scoring."""
 
+    # Languages opted into for semantic tokenization (set per-process from
+    # config `plugins.hermes-memory-store.tokenizers`). Class-level so the
+    # classmethod tokenizer paths can read it; default enables all.
+    enabled_tokenizers: set[str] = {"zh", "ja", "ko", "th"}
+
     def __init__(
         self,
         store: MemoryStore,
@@ -30,10 +36,20 @@ class FactRetriever:
         jaccard_weight: float = 0.3,
         hrr_weight: float = 0.3,
         hrr_dim: int = 1024,
+        enabled_tokenizers: set[str] | None = None,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
         self.hrr_dim = hrr_dim
+        # Languages the user explicitly opted into for semantic tokenization
+        # (config `plugins.hermes-memory-store.tokenizers: ["zh", ...]`).
+        # Default: all supported, so out-of-the-box the provider still tries
+        # each language's tokenizer; an empty set disables ALL lazy installs.
+        # Stored on the class so the classmethod tokenizer paths see it.
+        if enabled_tokenizers is not None:
+            type(self).enabled_tokenizers = set(enabled_tokenizers)
+        elif not getattr(type(self), "enabled_tokenizers", None):
+            type(self).enabled_tokenizers = {"zh", "ja", "ko", "th"}
 
         # Auto-redistribute weights if numpy unavailable
         if hrr_weight > 0 and not hrr._HAS_NUMPY:
@@ -535,6 +551,41 @@ class FactRetriever:
         """
         params.append(limit)
 
+        # Trigram only matches 3+ char terms; short CJK queries (e.g. 微信)
+        # need a LIKE fallback so they stay searchable.
+        like_patterns = self._short_term_like(query)
+        if like_patterns:
+            like_clauses = " OR ".join(
+                f"(f.content LIKE ? OR f.tags LIKE ?)"
+                for _ in like_patterns
+            )
+            like_params: list = []
+            for pat in like_patterns:
+                like_params.extend([pat, pat])
+            like_where = [f"({like_clauses})"]
+            if category:
+                like_where.append("f.category = ?")
+                like_params.append(category)
+            like_where.append("f.trust_score >= ?")
+            like_params.append(min_trust)
+            like_params.append(limit)
+            like_sql = f"""
+                SELECT f.*, 0.0 as fts_rank_raw
+                FROM facts f
+                WHERE {" AND ".join(like_where)}
+                ORDER BY f.trust_score DESC
+                LIMIT ?
+            """
+            try:
+                rows = conn.execute(like_sql, like_params).fetchall()
+            except Exception:
+                return []
+            if not rows:
+                return []
+            return [
+                {**dict(row), "fts_rank": 1.0} for row in rows
+            ]
+
         try:
             rows = conn.execute(sql, params).fetchall()
         except Exception:
@@ -596,41 +647,245 @@ class FactRetriever:
         "you", "your", "yours", "yourself", "yourselves",
     })
 
+    # ── Optional language-aware tokenizers (lazy-imported, see LAZY_DEPS
+    #    "memory.holographic.tokenizers"). Each is tried in order for the
+    #    scripts it knows; when absent the caller falls back to n-gram
+    #    trigram/LIKE matching which works for every script.
+    _TOKENIZER_CACHE: dict[str, Callable[[str], list[str]] | None] = {}
+
+    @classmethod
+    def _try_import_tokenizer(cls, name: str) -> Callable[[str], list[str]] | None:
+        """Best-effort import of an optional tokenizer; None when missing.
+
+        Catches both missing packages (ImportError) and broken runtimes
+        (e.g. konlpy requires a JVM, which may be absent) — anything that
+        prevents the tokenizer from actually running degrades to None so the
+        caller falls back to n-grams.
+        """
+        try:
+            if name == "jieba":
+                import jieba  # type: ignore[import-not-found]
+
+                jieba.setLogLevel(60)
+                return lambda text: list(jieba.cut_for_search(text))
+            if name == "pythainlp":
+                import pythainlp  # type: ignore[import-not-found]
+
+                return lambda text: list(pythainlp.tokenize.word_tokenize(text))
+            if name == "fugashi":
+                import fugashi  # type: ignore[import-not-found]
+
+                tagger = fugashi.Tagger()
+                return lambda text: [t.surface for t in tagger(text)]
+            if name == "konlpy":
+                from konlpy.tag import Okt  # type: ignore[import-not-found]
+
+                return Okt().morphs
+        except Exception:
+            return None
+        return None
+
+    # Optional tokenizer → lazy-deps feature name (see tools/lazy_deps.py).
+    # Each language is a separate feature so a user only installs what their
+    # queries actually use. konlpy (Korean) has no entry — it needs a JVM at
+    # import time, so users install it manually.
+    _TOKENIZER_FEATURES = {
+        "jieba": "memory.holographic.tokenizer.jieba",
+        "fugashi": "memory.holographic.tokenizer.fugashi",
+        "pythainlp": "memory.holographic.tokenizer.pythainlp",
+        "konlpy": None,
+    }
+
+    @classmethod
+    def _load_optional_tokenizer(
+        cls, name: str
+    ) -> Callable[[str], list[str]] | None:
+        """Return a callable tokenizer for *name* or None if not installed.
+
+        Cache the result so import cost is paid once per process. When the
+        package is missing, a lazy install is attempted via
+        ``tools.lazy_deps.ensure`` for that language's feature (so a Chinese
+        query never pulls the Japanese or Thai tokenizer); any failure —
+        including lazy installs disabled by config — degrades to None
+        (n-gram fallback) instead of raising.
+        """
+        if name in cls._TOKENIZER_CACHE:
+            return cls._TOKENIZER_CACHE[name]
+        tokenizer = cls._try_import_tokenizer(name)
+        feature = cls._TOKENIZER_FEATURES.get(name)
+        if tokenizer is None and feature is not None:
+            # One lazy-install attempt per missing package, then fall back.
+            try:
+                from tools.lazy_deps import ensure as _lazy_ensure
+
+                _lazy_ensure(feature, prompt=False)
+                tokenizer = cls._try_import_tokenizer(name)
+            except Exception:
+                tokenizer = None
+        cls._TOKENIZER_CACHE[name] = tokenizer
+        return tokenizer
+
+    # Unicode scripts that write without word separators; these get explicit
+    # tokenizer treatment (jieba for Han, pythainlp for Thai, fugashi for
+    # Japanese, konlpy for Hangul) with an n-gram fallback when the package
+    # is not installed. FTS5's default unicode61 tokenizer treats an
+    # unbroken CJK run as a single token, so a spaced query never matches.
+    _RE_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+    _RE_HIRAGANA = re.compile(r"[\u3040-\u309f]+")
+    _RE_KATAKANA = re.compile(r"[\u30a0-\u30ff]+")
+    _RE_HANGUL = re.compile(r"[\uac00-\ud7af]+")
+    _RE_THAI = re.compile(r"[\u0e00-\u0e7f]+")
+    _RE_OTHER_NOSPACE = re.compile(
+        r"[\u0e80-\u0eff\u1000-\u109f\u1780-\u17ff\u0f00-\u0fff]+"
+    )  # Lao, Myanmar, Khmer, Tibetan — no mature tokenizer, n-gram fallback
+
+    @classmethod
+    def _tokenize_query(cls, query: str) -> list[str]:
+        """Language-aware tokenization of a natural-language query.
+
+        Returns a list of search terms (not FTS5-syntax-quoted). English and
+        other space-delimited scripts are split on whitespace; Han/Hiragana/
+        Katakana/Hangul/Thai runs are handed to the optional installed
+        tokenizer when available (jieba/fugashi/konlpy/pythainlp) and fall
+        back to overlapping n-grams otherwise so any substring is searchable.
+        """
+        if not query:
+            return []
+        tokens: list[str] = []
+        _FTS_SPECIAL = "\"()*^:-+"
+        for raw in query.lower().split():
+            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>").translate(
+                str.maketrans("", "", _FTS_SPECIAL)
+            )
+            if not cleaned:
+                continue
+            # English/digit tokens pass through verbatim.
+            if not any(
+                [
+                    cls._RE_HAN.search(cleaned),
+                    cls._RE_HIRAGANA.search(cleaned),
+                    cls._RE_KATAKANA.search(cleaned),
+                    cls._RE_HANGUL.search(cleaned),
+                    cls._RE_THAI.search(cleaned),
+                    cls._RE_OTHER_NOSPACE.search(cleaned),
+                ]
+            ):
+                if len(cleaned) < 2:
+                    continue
+                if cleaned in cls._FTS_STOPWORDS:
+                    continue
+                tokens.append(cleaned)
+                continue
+            # No-space script(s): tokenize each run separately so one
+            # tokenizer never sees another script it cannot handle.
+            parts = re.split(
+                f"({cls._RE_HAN.pattern}|{cls._RE_HIRAGANA.pattern}|"
+                f"{cls._RE_KATAKANA.pattern}|{cls._RE_HANGUL.pattern}|"
+                f"{cls._RE_THAI.pattern}|{cls._RE_OTHER_NOSPACE.pattern})",
+                cleaned,
+            )
+            for part in parts:
+                if not part:
+                    continue
+                if len(part) < 2:
+                    continue
+                script_tokens: list[str] = []
+                if cls._RE_HAN.fullmatch(part):
+                    tok = (
+                        cls._load_optional_tokenizer("jieba")
+                        if "zh" in cls.enabled_tokenizers
+                        else None
+                    )
+                    if tok is not None:
+                        script_tokens = [w for w in tok(part) if len(w) >= 1]
+                elif cls._RE_HIRAGANA.fullmatch(part) or cls._RE_KATAKANA.fullmatch(part):
+                    tok = (
+                        cls._load_optional_tokenizer("fugashi")
+                        if "ja" in cls.enabled_tokenizers
+                        else None
+                    )
+                    if tok is not None:
+                        script_tokens = [w for w in tok(part) if len(w) >= 1]
+                elif cls._RE_HANGUL.fullmatch(part):
+                    tok = (
+                        cls._load_optional_tokenizer("konlpy")
+                        if "ko" in cls.enabled_tokenizers
+                        else None
+                    )
+                    if tok is not None:
+                        script_tokens = [w for w in tok(part) if len(w) >= 1]
+                elif cls._RE_THAI.fullmatch(part):
+                    tok = (
+                        cls._load_optional_tokenizer("pythainlp")
+                        if "th" in cls.enabled_tokenizers
+                        else None
+                    )
+                    if tok is not None:
+                        script_tokens = [w for w in tok(part) if len(w) >= 1]
+                if not script_tokens:
+                    # Fallback: overlapping n-grams (n=2 preserves 2-char
+                    # terms; trigram index still matches any 3+ substring).
+                    script_tokens = [
+                        part[i : i + 2] for i in range(len(part) - 1)
+                    ]
+                tokens.extend(script_tokens)
+        return tokens
+
+    @classmethod
+    def _build_fts_query(cls, tokens: list[str]) -> str:
+        """Join search tokens into an FTS5 MATCH expression.
+
+        OR-joins every token so any single term can hit (trigram matches
+        substrings of 3+ chars; LIKE covers shorter ones in the caller).
+        """
+        if not tokens:
+            return ""
+        return " OR ".join(f'"{t}"' for t in tokens if len(t) >= 3)
+
+    @classmethod
+    def _short_term_like(cls, query: str) -> list[str] | None:
+        """Return LIKE patterns for queries whose meaningful terms are all
+        shorter than 3 chars (trigram cannot match them), else None.
+
+        Terms shorter than 3 chars (typically overlapping n-grams from the
+        CJK fallback, e.g. 微信 or 한국/국어) cannot be AND-joined into a
+        single ``%a%b%`` pattern because overlapping grams never appear
+        consecutively in the source text (한국어 contains both 한국 and 국어
+        but not as a run). The returned list holds one ``%term%`` pattern
+        per short term; callers should OR them in SQL.
+        """
+        terms = [t for t in cls._tokenize_query(query) if len(t) < 3]
+        if not terms:
+            return None
+        seen: set[str] = set()
+        patterns = []
+        for t in terms:
+            if t not in seen:
+                seen.add(t)
+                patterns.append(f"%{t}%")
+        return patterns
+
     @classmethod
     def _sanitize_fts_query(cls, query: str) -> str:
         """Convert a natural-language query to an FTS5-safe OR expression.
 
-        FTS5 treats a multi-word MATCH argument as AND-joined by default,
-        which tanks recall on prose queries. This helper:
-          - tokenizes the query
-          - drops stopwords and short (<2 char) tokens
-          - strips FTS5 special characters from each token
-          - OR-joins the survivors
+        The store's ``facts_fts`` virtual table uses the trigram tokenizer
+        (language-agnostic substring search). This helper:
+          - tokenizes the query with language-aware tokenizers
+            (jieba/pythainlp/fugashi/konlpy when installed, n-gram fallback)
+          - strips FTS5 special characters
+          - OR-joins tokens of length >= 3 (trigram requires 3+ chars)
 
-        If nothing remains (pathological query), falls back to the raw
-        query so the caller sees zero results instead of a SQL error.
+        Queries whose terms are all shorter than 3 chars cannot be matched
+        by trigram; callers should detect that via :meth:`_short_term_like`
+        and run a LIKE query instead. If nothing remains, falls back to the
+        raw query so the caller sees zero results instead of a SQL error.
         """
-        if not query:
-            return ""
-        # Strip FTS5 operator characters from EACH token to avoid
-        # accidentally creating a malformed query.
-        _FTS_SPECIAL = '"()*^:-+'
-        tokens: list[str] = []
-        for raw in query.lower().split():
-            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>") .translate(
-                str.maketrans("", "", _FTS_SPECIAL)
-            )
-            if len(cleaned) < 2:
-                continue
-            if cleaned in cls._FTS_STOPWORDS:
-                continue
-            # FTS5 phrase-literal each token to ensure no special chars
-            # sneak through as operators.
-            tokens.append(f'"{cleaned}"')
-        if not tokens:
-            # Fallback: raw query (likely returns 0, but never crashes)
+        tokens = cls._tokenize_query(query)
+        match = cls._build_fts_query(tokens)
+        if not match:
             return query
-        return " OR ".join(tokens)
+        return match
 
     @staticmethod
     def _jaccard_similarity(set_a: set, set_b: set) -> float:
