@@ -377,13 +377,14 @@ def generate_title(
             # non-reasoning models just stop after the short answer. temperature=None: omitted from
             # the wire so default-only reasoning models accept the first request (#72351).
             max_tokens=2048, temperature=None, timeout=timeout, main_runtime=main_runtime,
-            # Strict json_schema response_format is rejected (HTTP 400) or
-            # silently aborted (empty content) by several OpenAI-compatible
-            # backends (DeepSeek, vLLM guided_grammar, LM Studio MLX
-            # Qwen3.x). Use free-text and let _extract_title_text's JSON scan
-            # + prose fallback handle the shape, which it already does for
-            # non-compliant providers.
-            extra_body={"response_format": {"type": "text"}},
+            # LM Studio's Qwen3.x (MLX) returns EMPTY `content` under strict
+            # json_schema response_format (it aborts instead of emitting the
+            # constrained object — observed with qwen3.6-27b). Free text is the
+            # API default, so we send NO response_format at all: a provider
+            # strict about the field's values (only json_object/json_schema, or
+            # rejecting it outright) can never be handed a format it refuses.
+            # _extract_title_text's JSON scan + prose fallback handles the
+            # shape, which it already does for non-compliant providers.
             # The module contract above promises thinking-disabled operation,
             # but nothing enforced it: with the aux default reasoning_effort
             # "" (provider default), Gemini enables internal thinking and
